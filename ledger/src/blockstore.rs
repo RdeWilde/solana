@@ -211,7 +211,12 @@ pub struct Blockstore {
     program_costs_cf: LedgerColumn<cf::ProgramCosts>,
     bank_hash_cf: LedgerColumn<cf::BankHash>,
     optimistic_slots_cf: LedgerColumn<cf::OptimisticSlots>,
+<<<<<<< HEAD
     last_root: RwLock<Slot>,
+=======
+    max_root: AtomicU64,
+    merkle_root_meta_cf: LedgerColumn<cf::MerkleRootMeta>,
+>>>>>>> e457c02879 (add merkle root meta column to blockstore (#33979))
     insert_shreds_lock: Mutex<()>,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
@@ -312,6 +317,7 @@ impl Blockstore {
         let program_costs_cf = db.column();
         let bank_hash_cf = db.column();
         let optimistic_slots_cf = db.column();
+        let merkle_root_meta_cf = db.column();
 
         let db = Arc::new(db);
 
@@ -365,6 +371,7 @@ impl Blockstore {
             program_costs_cf,
             bank_hash_cf,
             optimistic_slots_cf,
+            merkle_root_meta_cf,
             new_shreds_signals: Mutex::default(),
             completed_slots_senders: Mutex::default(),
             shred_timing_point_sender: None,
@@ -734,6 +741,7 @@ impl Blockstore {
         self.program_costs_cf.submit_rocksdb_cf_metrics();
         self.bank_hash_cf.submit_rocksdb_cf_metrics();
         self.optimistic_slots_cf.submit_rocksdb_cf_metrics();
+        self.merkle_root_meta_cf.submit_rocksdb_cf_metrics();
     }
 
     fn try_shred_recovery(
