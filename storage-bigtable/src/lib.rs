@@ -1,7 +1,12 @@
 #![allow(clippy::integer_arithmetic)]
 
+use std::env;
 use {
-    crate::bigtable::RowKey,
+    crate::{
+        bigtable::RowKey,
+        cache::cache::Cache,
+        cache::s3::S3Cache,
+    },
     log::*,
     serde::{Deserialize, Serialize},
     solana_metrics::datapoint_info,
@@ -45,6 +50,7 @@ mod access_token;
 mod bigtable;
 mod compression;
 mod root_ca_certificate;
+mod cache;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -67,7 +73,7 @@ pub enum Error {
     TokioJoinError(JoinError),
 }
 
-impl std::convert::From<bigtable::Error> for Error {
+impl From<bigtable::Error> for Error {
     fn from(err: bigtable::Error) -> Self {
         Self::BigTableError(err)
     }
@@ -480,14 +486,59 @@ impl LedgerStorage {
             app_profile_id,
             credential_type,
         } = config;
+
+        // FIXME switch cache type, and/or support multiple cache types?
+        let cache_enabled = !env::var("BIGTABLE_CACHE_ENABLED").unwrap_or_default().is_empty();
+
+        let mut cache: Option<Box<dyn Cache>> = None;
+        if cache_enabled {
+            info!("Using Bigtable cache");
+            let cache_type = env::var("BIGTABLE_CACHE_TYPE");
+
+            cache = match cache_type { // Meh
+                Ok(c) if c.to_lowercase() == "s3" => {
+                    info!("Configuring S3 cache");
+                    let access_key = env::var("S3_ACCESS_KEY").unwrap_or_default();
+                    let secret_key = env::var("S3_SECRET_KEY").unwrap_or_default();
+                    let endpoint = env::var("S3_ENDPOINT").unwrap_or_default();
+                    let bucket = env::var("S3_BUCKET").unwrap_or("bigtable".to_string());
+                    let region = env::var("S3_REGION").unwrap_or_default();
+                    let prefix = env::var("S3_PREFIX").unwrap_or("projects/solana-ledger".to_string());
+
+                    let full_prefix = format!("{}/instances/{}/tables", prefix, instance_name);
+
+                    match S3Cache::new(
+                        access_key,
+                        secret_key,
+                        endpoint,
+                        bucket,
+                        region,
+                        full_prefix,
+                    ).await {
+                        Ok(Some(cache)) => Some(Box::new(cache)),
+                        Ok(None) => None,
+                        Err(err) => {
+                            error!("Failed to initialize S3 cache: {}", err);
+                            None
+                        }
+                    }
+                },
+                _ => {
+                    error!("No valid cache type specified");
+                    None
+                }
+            };
+        }
+
         let connection = bigtable::BigTableConnection::new(
             instance_name.as_str(),
             app_profile_id.as_str(),
             read_only,
             timeout,
             credential_type,
-        )
-        .await?;
+            cache,
+        ).await?;
+
         Ok(Self { stats, connection })
     }
 

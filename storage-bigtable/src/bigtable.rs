@@ -1,19 +1,19 @@
 // Primitives for reading/writing BigTable tables
 
 use {
+    backoff::{ExponentialBackoff, future::retry},
     crate::{
         access_token::{AccessToken, Scope},
         compression::{compress_best, decompress},
-        root_ca_certificate, CredentialType,
+        CredentialType, root_ca_certificate,
     },
-    backoff::{future::retry, ExponentialBackoff},
     log::*,
     std::{
         str::FromStr,
         time::{Duration, Instant},
     },
     thiserror::Error,
-    tonic::{codegen::InterceptedService, transport::ClientTlsConfig, Request, Status},
+    tonic::{codegen::InterceptedService, Request, Status, transport::ClientTlsConfig},
 };
 
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -34,6 +34,7 @@ mod google {
     }
 }
 use google::bigtable::v2::*;
+use crate::cache::cache::{Cache, CacheError};
 
 pub type RowKey = String;
 pub type RowData = Vec<(CellName, CellValue)>;
@@ -82,6 +83,9 @@ pub enum Error {
 
     #[error("Timeout")]
     Timeout,
+
+    #[error("Cache error: {0}")]
+    CacheError(#[from] CacheError),
 }
 
 impl std::convert::From<std::io::Error> for Error {
@@ -105,6 +109,7 @@ impl std::convert::From<tonic::Status> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 type InterceptedRequestResult = std::result::Result<Request<()>, Status>;
 
+
 #[derive(Clone)]
 pub struct BigTableConnection {
     access_token: Option<AccessToken>,
@@ -112,6 +117,7 @@ pub struct BigTableConnection {
     table_prefix: String,
     app_profile_id: String,
     timeout: Option<Duration>,
+    cache: Option<Box<dyn Cache>>,
 }
 
 impl BigTableConnection {
@@ -132,6 +138,7 @@ impl BigTableConnection {
         read_only: bool,
         timeout: Option<Duration>,
         credential_type: CredentialType,
+        cache: Option<Box<dyn Cache>>,
     ) -> Result<Self> {
         match std::env::var("BIGTABLE_EMULATOR_HOST") {
             Ok(endpoint) => {
@@ -201,6 +208,7 @@ impl BigTableConnection {
                     table_prefix,
                     app_profile_id: app_profile_id.to_string(),
                     timeout,
+                    cache,
                 })
             }
         }
@@ -220,6 +228,7 @@ impl BigTableConnection {
             table_prefix: format!("projects/emulator/instances/{instance_name}/tables/"),
             app_profile_id: app_profile_id.to_string(),
             timeout,
+            cache: None,
         })
     }
 
@@ -252,6 +261,7 @@ impl BigTableConnection {
             table_prefix: self.table_prefix.clone(),
             app_profile_id: self.app_profile_id.clone(),
             timeout: self.timeout,
+            cache: self.cache.clone(), // FIXME clone
         }
     }
 
@@ -315,6 +325,7 @@ pub struct BigTable<F: FnMut(Request<()>) -> InterceptedRequestResult> {
     table_prefix: String,
     app_profile_id: String,
     timeout: Option<Duration>,
+    cache: Option<Box<dyn Cache>>,
 }
 
 impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
@@ -423,6 +434,7 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
         if rows_limit == 0 {
             return Ok(vec![]);
         }
+
         self.refresh_access_token().await;
         let response = self
             .client
@@ -469,7 +481,6 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
     /// Check whether a row key exists in a `table`
     pub async fn row_key_exists(&mut self, table_name: &str, row_key: RowKey) -> Result<bool> {
         self.refresh_access_token().await;
-
         let response = self
             .client
             .read_rows(ReadRowsRequest {
@@ -513,32 +524,87 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
         if rows_limit == 0 {
             return Ok(vec![]);
         }
-        self.refresh_access_token().await;
-        let response = self
-            .client
-            .read_rows(ReadRowsRequest {
-                table_name: format!("{}{}", self.table_prefix, table_name),
-                app_profile_id: self.app_profile_id.clone(),
-                rows_limit,
-                rows: Some(RowSet {
-                    row_keys: vec![],
-                    row_ranges: vec![RowRange {
-                        start_key: start_at.map(|row_key| {
-                            row_range::StartKey::StartKeyClosed(row_key.into_bytes())
-                        }),
-                        end_key: end_at
-                            .map(|row_key| row_range::EndKey::EndKeyClosed(row_key.into_bytes())),
-                    }],
-                }),
-                filter: Some(RowFilter {
-                    // Only return the latest version of each cell
-                    filter: Some(row_filter::Filter::CellsPerColumnLimitFilter(1)),
-                }),
-            })
-            .await?
-            .into_inner();
 
-        self.decode_read_rows_response(response).await
+        let mut result: Vec<(RowKey, RowData)> = vec![];
+
+        if self.cache.is_some() {
+            let from_cache = self.cache
+                .as_mut()
+                .unwrap()
+                .get_row_data(table_name, start_at.clone(), end_at.clone(), rows_limit.clone())
+                .await;
+
+            match from_cache {
+                Ok(_) => {
+                    println!("grabbed row data from cache {}/{:?}-{:?}", table_name, start_at.clone().unwrap_or("".to_string()), end_at.clone().unwrap_or("".to_string()));
+
+                    result.append(&mut from_cache.unwrap_or_default())
+                },
+                Err(err) => {
+                    eprintln!("did not grab cache: {:?}", err);
+                }
+            }
+        }
+
+        self.refresh_access_token().await;
+
+        // Get all the keys from bigtable
+        let bigtable_keys = self.get_row_keys(table_name, start_at.clone(), end_at.clone(), rows_limit.clone()).await?;
+
+        // Determine which rows we still need to fetch from bigtable
+        let mut keys_to_fetch = vec![];
+        for key in bigtable_keys {
+            if !result.iter().any(|(k, _)| k == &key) {
+                keys_to_fetch.push(key.into_bytes());
+            }
+        }
+
+        if !keys_to_fetch.is_empty() {
+            let response = self
+                .client
+                .read_rows(ReadRowsRequest {
+                    table_name: format!("{}{}", self.table_prefix, table_name),
+                    app_profile_id: self.app_profile_id.clone(),
+                    rows_limit,
+                    rows: Some(RowSet {
+                        row_keys: keys_to_fetch,
+                        row_ranges: vec![],
+                    }),
+                    filter: Some(RowFilter {
+                        // Only return the latest version of each cell
+                        filter: Some(row_filter::Filter::CellsPerColumnLimitFilter(1)),
+                    }),
+                })
+                .await?
+                .into_inner();
+
+            let from_bigtable = self.decode_read_rows_response(response).await;
+
+            // Add the rows we fetched from bigtable to the ones from cache
+            result.append(&mut from_bigtable?);
+
+
+            if self.cache.is_some() {
+                for (key, row_data) in &result {
+                    let from_cache = self.cache
+                        .as_mut()
+                        .unwrap()
+                        .put_row_data(table_name, "x", &[(&key.clone(), row_data.clone())])
+                        .await;
+
+                    match from_cache {
+                        Ok(_) => {
+                            println!("Updated cache");
+                        },
+                        Err(err) => {
+                            eprintln!("Did not update cache: {:?}", err);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get latest data from multiple rows of `table`, if those rows exist.
@@ -547,30 +613,85 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
         table_name: &str,
         row_keys: &[RowKey],
     ) -> Result<Vec<(RowKey, RowData)>> {
+        let mut result: Vec<(RowKey, RowData)> = vec![];
+
+        if self.cache.is_some() {
+            let from_cache = self.cache
+                .as_mut()
+                .unwrap()
+                .get_multi_row_data(table_name, row_keys)
+                .await;
+
+            match from_cache {
+                Ok(_) => {
+                    println!("Fetched from cache");
+                    result.append(&mut from_cache.unwrap_or_default())
+                },
+                Err(err) => {
+                    eprintln!("did not grab cache: {:?}", err);
+                }
+            }
+        }
+
         self.refresh_access_token().await;
 
-        let response = self
-            .client
-            .read_rows(ReadRowsRequest {
-                table_name: format!("{}{}", self.table_prefix, table_name),
-                app_profile_id: self.app_profile_id.clone(),
-                rows_limit: 0, // return all existing rows
-                rows: Some(RowSet {
-                    row_keys: row_keys
-                        .iter()
-                        .map(|k| k.as_bytes().to_vec())
-                        .collect::<Vec<_>>(),
-                    row_ranges: vec![],
-                }),
-                filter: Some(RowFilter {
-                    // Only return the latest version of each cell
-                    filter: Some(row_filter::Filter::CellsPerColumnLimitFilter(1)),
-                }),
-            })
-            .await?
-            .into_inner();
+        // Determine which rows we still need to fetch from bigtable by comparing row_keys to result
+        let mut keys_to_fetch = vec![];
+        for key in row_keys {
+            if !result.iter().any(|(k, _)| k.eq(key)) {
+                keys_to_fetch.push(key.clone().into_bytes());
+            }
+        }
 
-        self.decode_read_rows_response(response).await
+
+        if !keys_to_fetch.is_empty() {
+            let response = self
+                .client
+                .read_rows(ReadRowsRequest {
+                    table_name: format!("{}{}", self.table_prefix, table_name),
+                    app_profile_id: self.app_profile_id.clone(),
+                    rows_limit: 0, // return all existing rows
+                    rows: Some(RowSet {
+                        row_keys: row_keys
+                            .iter()
+                            .map(|k| k.as_bytes().to_vec())
+                            .collect::<Vec<_>>(),
+                        row_ranges: vec![],
+                    }),
+                    filter: Some(RowFilter {
+                        // Only return the latest version of each cell
+                        filter: Some(row_filter::Filter::CellsPerColumnLimitFilter(1)),
+                    }),
+                })
+                .await?
+                .into_inner();
+
+            let mut from_bigtable = self.decode_read_rows_response(response).await?;
+
+            // Add the rows we fetched from bigtable to the ones from cache
+            result.append(&mut from_bigtable);
+
+            if self.cache.is_some() {
+                for (key, row_data) in &result {
+                    let from_cache = self.cache
+                        .as_mut()
+                        .unwrap()
+                        .put_row_data(table_name, "x", &[(&key.clone(), row_data.clone())])
+                        .await;
+
+                    match from_cache {
+                        Ok(_) => {
+                            println!("Updated cache");
+                        },
+                        Err(err) => {
+                            eprintln!("Did not update cache: {:?}", err);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get latest data from a single row of `table`, if that row exists. Returns an error if that
@@ -583,8 +704,25 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
         table_name: &str,
         row_key: RowKey,
     ) -> Result<RowData> {
-        self.refresh_access_token().await;
+        if self.cache.is_some() {
+            let from_cache = self.cache
+                .as_mut()
+                .unwrap()
+                .get_single_row_data(table_name, row_key.clone())
+                .await;
 
+            match from_cache {
+                Ok(_) => {
+                    println!("grabbed single row from cache {}/{}", table_name, row_key.clone().to_string());
+                    return  Ok(from_cache.unwrap());
+                },
+                Err(err) => {
+                    eprintln!("did not grab cache: {:?}", err);
+                }
+            }
+        }
+
+        self.refresh_access_token().await;
         let response = self
             .client
             .read_rows(ReadRowsRequest {
@@ -604,6 +742,26 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
             .into_inner();
 
         let rows = self.decode_read_rows_response(response).await?;
+
+        if self.cache.is_some() {
+            for (key, row_data) in &rows {
+                let from_cache = self.cache
+                    .as_mut()
+                    .unwrap()
+                    .put_row_data(table_name, "x", &[(&key.clone(), row_data.clone())])
+                    .await;
+
+                match from_cache {
+                    Ok(_) => {
+                        println!("Updated cache");
+                    },
+                    Err(err) => {
+                        eprintln!("Did not update cache: {:?}", err);
+                    }
+                }
+            }
+        }
+
         rows.into_iter()
             .next()
             .map(|r| r.1)
@@ -659,7 +817,6 @@ impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
         row_data: &[(&RowKey, RowData)],
     ) -> Result<()> {
         self.refresh_access_token().await;
-
         let mut entries = vec![];
         for (row_key, row_data) in row_data {
             let mutations = row_data
@@ -880,7 +1037,6 @@ where
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
         crate::StoredConfirmedBlock,
         prost::Message,
         solana_sdk::{
@@ -893,6 +1049,7 @@ mod tests {
             VersionedTransactionWithStatusMeta,
         },
         std::convert::TryInto,
+        super::*,
     };
 
     fn confirmed_block_into_protobuf(confirmed_block: ConfirmedBlock) -> generated::ConfirmedBlock {

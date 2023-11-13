@@ -10,6 +10,9 @@ license = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
+async-trait = "0.1.74"
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 backoff = { workspace = true, features = ["tokio"] }
 bincode = { workspace = true }
 bytes = { workspace = true }
@@ -32,9 +35,12 @@ solana-sdk = { workspace = true }
 solana-storage-proto = { workspace = true }
 solana-transaction-status = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 tonic = { workspace = true, features = ["tls", "transport"] }
 zstd = { workspace = true }
+tokio-stream = "0.1.12"
+rustls-native-certs = "0.6.1"
+rustls = "0.20.9"
 
 # openssl is a dependency of the goauth and smpl_jwt crates, but explicitly
 # declare it here as well to activate the "vendored" feature that builds OpenSSL

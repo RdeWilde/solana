@@ -126,7 +126,7 @@ async fn block(
             BlockEncodingOptions {
                 transaction_details: TransactionDetails::Full,
                 show_rewards: true,
-                max_supported_transaction_version: None,
+                max_supported_transaction_version: Some(1),
             },
         )
         .map_err(|err| match err {
